@@ -54,8 +54,8 @@ rf.fit.final <- ranger(
   formula         = popularity ~ ., 
   data            = df.train,  
   num.trees       = 1000,
-  mtry            = oo[1,]$mtry,
-  min.node.size   = oo[1,]$node_size,
+  mtry            = oo[1,]$mtry, #11
+  min.node.size   = oo[1,]$node_size, #1
 )
 
 yhat.rf = predict(rf.fit.final, data = df.test)$predictions
@@ -75,9 +75,9 @@ X.test = as.matrix(df.test[,2:25])
 Y.train = df.train$popularity
 
 hyper_grid_xgb <- expand.grid(
-  shrinkage = c(0.001, .01, .1, 1),         ## controls the learning rate
-  interaction.depth = c(1, 2, 4), ## tree depth
-  bag.fraction = c(.5, .65, .8, .9),  ##  percent of training data to sample for each tree
+  shrinkage = c(.01, .1, 1),         ## controls the learning rate
+  interaction.depth = c(1, 2, 4, 6), ## tree depth
+  bag.fraction = c(.5, .65, .8),  ##  percent of training data to sample for each tree
   optimal_trees = 0,              # a place to dump results
   min_RMSE = 0                    # a place to dump results
 )
@@ -119,9 +119,9 @@ for(i in 1:nrow(hyper_grid_xgb)) {
 
 # parameter list
 params <- list(
-  eta = oo[1,]$shrinkage,
-  max_depth = oo[1,]$interaction.depth,
-  subsample = oo[1,]$bag.fraction
+  eta = oo[1,]$shrinkage, #0.01
+  max_depth = oo[1,]$interaction.depth, #4
+  subsample = oo[1,]$bag.fraction #0.65
 )
 
 # train final model
