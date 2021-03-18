@@ -1,0 +1,311 @@
+---
+title: An R Markdown document converted from "~/BUSN41204 Machine Learning/SpotifyPopularity/r_code/numeric_predict.ipynb"
+output: html_document
+---
+
+---
+title: "Spotify Project"
+subtitle: "Numeric prediction model"
+author: "Oleg Ryzhkov (oryzhkov@chicagobooth.edu), Joe Faller (jfaller0@chciagobooth.edu)"
+date: March 17, 2021
+output: Numeric Prediction: Neural Network, Random Forest, and Boosted Models 
+---
+
+Load relevant R packages 
+
+```{r}
+library(h2o)
+library(ranger)
+library(caret)
+library(dplyr)
+library(xgboost)
+```
+
+```{r}
+# Start up a 1-node H2O server on your local machine, 
+# and allow it to use all CPU cores and up to 8GB of memory.
+
+h2o.init(nthreads=-1, max_mem_size="8G")
+h2o.no_progress()
+h2o.removeAll()
+```
+
+The `h2o.deeplearning` function fits H2O's 
+Deep Learning models from within R.
+
+While H2O Deep Learning has many parameters, it is quite easy to use.
+Most often we can use the default parameters for many of the inputs.
+We should change the following parameters:
+
+- the number and sizes of hidden layers;
+- the number of epochs and the activation function;
+- add some regularization technique.
+  
+  
+We will apply it to `target_numeric_popularity` data, which
+we got cleaning and transforming the original dataset.
+
+```{r}
+# download the file if it does not exist
+
+target.df <- h2o.importFile('https://raw.githubusercontent.com/OlegRyzhkov2020/SpotifyPopularity/main/data/target_numeric_popularity.csv')
+target.df <- target.df[,-1]
+dim(target.df)
+head(target.df)
+```
+
+```{r}
+splits <- h2o.splitFrame(target.df, c(0.6,0.2), seed=1)
+train  <- h2o.assign(splits[[1]], "train.hex") # 60%
+valid  <- h2o.assign(splits[[2]], "valid.hex") # 20%
+test   <- h2o.assign(splits[[3]], "test.hex")  # 20%
+
+df.train <- rbind(as.data.frame(train),as.data.frame(valid))
+df.test  <- as.data.frame(test)
+```
+
+
+
+##Neural Net
+
+We build our first Deep Learning model
+where we predict the `popularity` column
+using the remaining 24  variables. `h2o` 
+will automatically use automatic one-hot encoding.
+
+```{r}
+response <- "popularity"
+predictors <- setdiff(names(target.df), response)
+predictors
+```
+
+
+**Tuning with Random Search**
+
+Hyper-parameter search for more than 4 parameters can be done
+more efficiently with random parameter search.
+
+```{r}
+hyper_params <- list(
+  activation=c("Rectifier","Tanh","RectifierWithDropout","TanhWithDropout"),
+  hidden=list(c(20,20),c(50,50),c(30,30,30),c(25,25,25,25),c(64,64,64,64)),
+  input_dropout_ratio=c(0,0.05),
+  l1=seq(0,1e-4,1e-6),
+  l2=seq(0,1e-4,1e-6),
+  max_w2=c(5,10,15),
+  epochs=c(100,200,500,1000)
+)
+```
+
+```{r}
+## Stop once the top 5 models are within 1% of each other
+## 
+##     - the windowed average varies less than 1%
+##
+search_criteria = list(
+  strategy = "RandomDiscrete", 
+  max_runtime_secs = 360, 
+  max_models = 100, 
+  seed=1, 
+  stopping_rounds=5,
+  stopping_tolerance=1e-2
+  )
+
+dl_random_grid <- h2o.grid(
+  algorithm="deeplearning",
+  grid_id = "dl_grid_random",
+  training_frame=train,
+  validation_frame=valid, 
+  x=predictors, 
+  y=response,
+  stopping_metric="MSE",
+  stopping_tolerance=1e-2,        ## stop when MSE does not improve by >=1% for 2 scoring events
+  stopping_rounds=2,
+  score_duty_cycle=0.025,         ## don't score more than 2.5% of the wall time
+  hyper_params = hyper_params,
+  search_criteria = search_criteria
+)      
+```
+
+```{r}
+grid <- h2o.getGrid("dl_grid_random", sort_by="RMSE", decreasing=FALSE)
+grid
+```
+
+```{r}
+grid@summary_table[1,]
+best_model <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+best_model
+plot(best_model)
+
+relImp.h2o <- h2o.varimp(best_model)$relative_importance
+names(relImp.h2o) <- vi$variable
+relImp.h2o <- sort(relImp.h2o)
+
+barchart(relImp.h2o,col='grey',main="Relative Variable Importance - Neural Network Model",xlim=c(0,1),xlab='')
+
+```
+
+```{r}
+h2o.performance(best_model, newdata=test)
+```
+
+
+##Random Forest
+
+We tune a 1000-tree random forest across various hyperparameters
+
+```{r}
+hyper_grid <- expand.grid(
+  mtry       = seq(9, 15, by = 2),
+  node_size  = c(1, 5, 10),
+  OOB_RMSE   = 0
+)
+
+for(i in 1:nrow(hyper_grid)) {
+  
+  model <- ranger(
+    formula         = popularity ~ ., 
+    data            = df.train, 
+    num.trees       = 1000,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    seed            = 345,
+    importance      = 'impurity'  
+  )
+  
+  hyper_grid$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}
+
+(oo = hyper_grid %>% 
+    dplyr::arrange(OOB_RMSE) %>%
+    head(10))
+
+```
+
+
+Fitting our final model:
+
+```{r final fit}
+rf.fit.final <- ranger(
+  formula         = popularity ~ ., 
+  data            = df.train,  
+  num.trees       = 1000,
+  mtry            = oo[1,]$mtry, #11
+  min.node.size   = oo[1,]$node_size, #1
+  importance      = 'impurity'  
+)
+```
+
+Final Performance:
+
+```{r RF Performance}
+yhat.rf = predict(rf.fit.final, data = df.test)$predictions
+mse.rf = mean((df.test$popularity-yhat.rf)^2)
+rmse.rf = sqrt(mean((df.test$popularity-yhat.rf)^2))
+mae.rf = mean(abs(df.test$popularity-yhat.rf))
+r2.rf   = 1 - sum((df.test$popularity-yhat.rf)^2)/sum((df.test$popularity-mean(df.test$popularity))^2)
+
+cat("MSE: ", mse.rf)
+cat("\nRMSE: ", rmse.rf)
+cat("\nMAE: ", mae.rf)
+
+varImp = importance(rf.fit.final)
+varImp = sort(varImp)
+relImp = varImp/max(varImp)
+barchart(relImp,col='grey',main="Relative Variable Importance - Random Forest Model",xlim=c(0,1),xlab='')
+```
+
+##Boosted
+
+Tuning:
+
+```{r Boosted}
+X.train = as.matrix(df.train[,2:25])
+X.test = as.matrix(df.test[,2:25])
+Y.train = df.train$popularity
+
+hyper_grid_xgb <- expand.grid(
+  shrinkage = c(.01, .1, 1),         ## controls the learning rate
+  interaction.depth = c(1, 2, 4, 6), ## tree depth
+  bag.fraction = c(.5, .65, .8),  ##  percent of training data to sample for each tree
+  optimal_trees = 0,              # a place to dump results
+  min_RMSE = 0                    # a place to dump results
+)
+
+for(i in 1:nrow(hyper_grid_xgb)) {
+  (i)
+  # create parameter list
+  params <- list(
+    eta = hyper_grid_xgb$shrinkage[i],
+    max_depth = hyper_grid_xgb$interaction.depth[i],
+    subsample = hyper_grid_xgb$bag.fraction[i]
+  )
+  
+  # reproducibility
+  set.seed(41654)
+  
+  # train model
+  xgb.tune <- xgb.cv(
+    params               = params,
+    data                 = X.train,
+    label                = Y.train,
+    nrounds              = 5000,
+    nfold                = 5,
+    objective            = "reg:squarederror",
+    verbose              = 0,
+    verbosity            = 0,
+    nthread              = 5,
+    early_stopping_rounds = 10     # stop if no improvement for 10 consecutive trees
+  )
+  
+  # add min training error and trees to grid
+  hyper_grid_xgb$optimal_trees[i] <- which.min(xgb.tune$evaluation_log$test_rmse_mean)
+  hyper_grid_xgb$min_RMSE[i] <- min(xgb.tune$evaluation_log$test_rmse_mean)  
+}
+
+(oo = hyper_grid_xgb %>%
+    dplyr::arrange(min_RMSE) %>%
+    head(10))
+```
+
+Final fitting:
+
+```{r Boost Final Fit}
+# parameter list
+params <- list(
+  eta = oo[1,]$shrinkage, #0.01
+  max_depth = oo[1,]$interaction.depth, #4
+  subsample = oo[1,]$bag.fraction #0.65
+)
+
+# train final model
+xgb.fit.final <- xgboost(
+  params = params,
+  data = X.train,
+  label = Y.train,
+  nrounds = oo[1,]$optimal_trees,
+  objective = "reg:squarederror",
+  verbose = 0,
+  verbosity = 0
+)
+```
+
+Final Performance:
+```{r}
+yhat.xgb = predict(xgb.fit.final, newdata=X.test)
+mse.xgb = mean((df.test$popularity-yhat.xgb)^2)
+rmse.xgb = sqrt(mean((df.test$popularity-yhat.xgb)^2))
+#7.87906
+r2.xgb   = 1 - sum((df.test$popularity-yhat.xgb)^2)/sum((df.test$popularity-mean(df.test$popularity))^2)
+#0.92365
+mae.xgb = mean(abs(df.test$popularity-yhat.xgb))
+
+cat("MSE: ", mse.xgb)
+cat("\nRMSE: ", rmse.xgb)
+cat("\nMAE: ", mae.xgb)
+
+mat <- xgb.importance(feature_names = colnames(X.train), model = xgb.fit.final)
+xgb.plot.importance(importance_matrix = mat,rel_to_first = TRUE)+title(main="Relative Variable Importance - Boosted Model")
+```
+
