@@ -54,6 +54,7 @@ dim(target.df)
 head(target.df)
 ```
 
+
 ```{r}
 splits <- h2o.splitFrame(target.df, c(0.6,0.2), seed=1)
 train  <- h2o.assign(splits[[1]], "train.hex") # 60%
@@ -309,3 +310,216 @@ mat <- xgb.importance(feature_names = colnames(X.train), model = xgb.fit.final)
 xgb.plot.importance(importance_matrix = mat,rel_to_first = TRUE)+title(main="Relative Variable Importance - Boosted Model")
 ```
 
+
+### New Artist Predictions
+
+Seeing that artist characteristics like average popularity of other songs is one of our most important variables, we examine popularity of songs where that information is not available (e.g. new artists)
+
+```{r}
+df.test.newonly <- df.test[df.test$artist.trackrankedcount==0&df.test$popularity>0,]
+X.test.newonly = as.matrix(df.test.newonly[,2:25])
+```
+
+Random Forest performance:
+```{r}
+yhat.rf.new = predict(rf.fit.final, data = df.test.newonly)$predictions
+mse.rf.new = mean((df.test.newonly$popularity-yhat.rf.new)^2)
+rmse.rf.new = sqrt(mean((df.test.newonly$popularity-yhat.rf.new)^2))
+mae.rf.new = mean(abs(df.test.newonly$popularity-yhat.rf.new))
+r2.rf.new   = 1 - sum((df.test.newonly$popularity-yhat.rf.new)^2)/sum((df.test.newonly$popularity-mean(df.test.newonly$popularity))^2)
+
+cat("MSE: ", mse.rf.new)
+cat("\nRMSE: ", rmse.rf.new)
+cat("\nMAE: ", mae.rf.new)
+```
+
+Boosted performance:
+```{r}
+yhat.xgb.new = predict(xgb.fit.final, newdata=X.test.newonly)
+mse.xgb.new = mean((df.test.newonly$popularity-yhat.xgb.new)^2)
+rmse.xgb.new = sqrt(mean((df.test.newonly$popularity-yhat.xgb.new)^2))
+r2.xgb.new   = 1 - sum((df.test.newonly$popularity-yhat.xgb.new)^2)/sum((df.test.newonly$popularity-mean(df.test.newonly$popularity))^2)
+mae.xgb.new = mean(abs(df.test.newonly$popularity-yhat.xgb.new))
+
+cat("MSE: ", mse.xgb.new)
+cat("\nRMSE: ", rmse.xgb.new)
+cat("\nMAE: ", mae.xgb.new)
+
+```
+
+We note that our models perform much worse, as expected, on artists with very few other tracks.
+
+We retrain our Random Forest and boosted models on new artist data
+
+```{r}
+target.df.new <- target.df[target.df$artist.trackrankedcount==0&target.df$popularity>0,]
+target.df.new <- target.df.new[,1:21]
+dim(target.df.new)
+head(target.df.new)
+```
+
+```{r}
+
+splits <- h2o.splitFrame(target.df.new, c(0.6,0.2), seed=1)
+train.new  <- h2o.assign(splits[[1]], "train.hex") # 60%
+valid.new  <- h2o.assign(splits[[2]], "valid.hex") # 20%
+test.new   <- h2o.assign(splits[[3]], "test.hex")  # 20%
+
+df.train.new <- rbind(as.data.frame(train.new),as.data.frame(valid.new))
+df.test.new  <- as.data.frame(test.new)
+X.train.new <- as.matrix(df.train.new[,2:21])
+Y.train.new <- df.train.new$popularity
+X.test.new <- as.matrix(df.test.new[,2:21])
+```
+
+#Random Forest for New Artists
+
+```{r}
+hyper_grid.new <- expand.grid(
+  mtry       = seq(3, 15, by = 2),
+  node_size  = c(1, 5, 10),
+  OOB_RMSE   = 0
+)
+
+for(i in 1:nrow(hyper_grid.new)) {
+  
+  model <- ranger(
+    formula         = popularity ~ ., 
+    data            = df.train.new, 
+    num.trees       = 1000,
+    mtry            = hyper_grid.new$mtry[i],
+    min.node.size   = hyper_grid.new$node_size[i],
+    seed            = 345,
+    importance      = 'impurity'  
+  )
+  
+  hyper_grid.new$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}
+
+(oo = hyper_grid.new %>% 
+    dplyr::arrange(OOB_RMSE) %>%
+    head(10))
+
+```
+
+
+Fitting our final model:
+
+```{r final fit}
+rf.fit.final.new <- ranger(
+  formula         = popularity ~ ., 
+  data            = df.train.new,  
+  num.trees       = 1000,
+  mtry            = oo[1,]$mtry,
+  min.node.size   = oo[1,]$node_size,
+  importance      = 'impurity'  
+)
+```
+
+Final Performance:
+
+```{r RF Performance}
+yhat.rf.new = predict(rf.fit.final.new, data = df.test.new)$predictions
+mse.rf.new = mean((df.test.new$popularity-yhat.rf.new)^2)
+rmse.rf.new = sqrt(mean((df.test.new$popularity-yhat.rf.new)^2))
+mae.rf.new = mean(abs(df.test.new$popularity-yhat.rf.new))
+r2.rf.new   = 1 - sum((df.test.new$popularity-yhat.rf.new)^2)/sum((df.test.new$popularity-mean(df.test.new$popularity))^2)
+
+cat("MSE: ", mse.rf.new)
+cat("\nRMSE: ", rmse.rf.new)
+cat("\nMAE: ", mae.rf.new)
+
+varImp.new = importance(rf.fit.final.new)
+varImp.new = sort(varImp.new)
+relImp.new = varImp.new/max(varImp.new)
+barchart(relImp.new,col='grey',main="Relative Variable Importance - Random Forest Model",xlim=c(0,1),xlab='')
+```
+
+#Boosted for New Artists
+
+Tuning:
+
+```{r Boosted}
+
+hyper_grid_xgb.new <- expand.grid(
+  shrinkage = c(.01, .1, 1),         ## controls the learning rate
+  interaction.depth = c(1, 2, 4, 6), ## tree depth
+  bag.fraction = c(.5, .65, .8),  ##  percent of training data to sample for each tree
+  optimal_trees = 0,              # a place to dump results
+  min_RMSE = 0                    # a place to dump results
+)
+
+for(i in 1:nrow(hyper_grid_xgb.new)) {
+  (i)
+  # create parameter list
+  params <- list(
+    eta = hyper_grid_xgb.new$shrinkage[i],
+    max_depth = hyper_grid_xgb.new$interaction.depth[i],
+    subsample = hyper_grid_xgb.new$bag.fraction[i]
+  )
+  
+  # reproducibility
+  set.seed(41654)
+  
+  # train model
+  xgb.tune <- xgb.cv(
+    params               = params,
+    data                 = X.train.new,
+    label                = Y.train.new,
+    nrounds              = 5000,
+    nfold                = 5,
+    objective            = "reg:squarederror",
+    verbose              = 0,
+    verbosity            = 0,
+    nthread              = 5,
+    early_stopping_rounds = 10     # stop if no improvement for 10 consecutive trees
+  )
+  
+  # add min training error and trees to grid
+  hyper_grid_xgb.new$optimal_trees[i] <- which.min(xgb.tune$evaluation_log$test_rmse_mean)
+  hyper_grid_xgb.new$min_RMSE[i] <- min(xgb.tune$evaluation_log$test_rmse_mean)  
+}
+
+(oo = hyper_grid_xgb.new %>%
+    dplyr::arrange(min_RMSE) %>%
+    head(10))
+```
+
+Final fitting:
+
+```{r Boost Final Fit}
+# parameter list
+params <- list(
+  eta = oo[1,]$shrinkage, #0.01
+  max_depth = oo[1,]$interaction.depth, #4
+  subsample = oo[1,]$bag.fraction #0.65
+)
+
+# train final model
+xgb.fit.final.new <- xgboost(
+  params = params,
+  data = X.train.new,
+  label = Y.train.new,
+  nrounds = oo[1,]$optimal_trees,
+  objective = "reg:squarederror",
+  verbose = 0,
+  verbosity = 0
+)
+```
+
+Final Performance:
+```{r}
+yhat.xgb.new = predict(xgb.fit.final.new, newdata=X.test.new)
+mse.xgb.new = mean((df.test.new$popularity-yhat.xgb.new)^2)
+rmse.xgb.new = sqrt(mean((df.test.new$popularity-yhat.xgb.new)^2))
+r2.xgb.new   = 1 - sum((df.test.new$popularity-yhat.xgb.new)^2)/sum((df.test.new$popularity-mean(df.test.new$popularity))^2)
+mae.xgb.new = mean(abs(df.test.new$popularity-yhat.xgb.new))
+
+cat("MSE: ", mse.xgb.new)
+cat("\nRMSE: ", rmse.xgb.new)
+cat("\nMAE: ", mae.xgb.new)
+
+
+mat <- xgb.importance(feature_names = colnames(X.train.new), model = xgb.fit.final.new)
+xgb.plot.importance(importance_matrix = mat,rel_to_first = TRUE)+title(main="Relative Variable Importance - Boosted Model")
+```
